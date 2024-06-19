@@ -13,6 +13,7 @@
 import logging
 import os
 import re
+import shutil
 
 from wic import WicError
 from wic.engine import get_custom_config
@@ -24,10 +25,25 @@ logger = logging.getLogger('wic')
 
 class BootimgPcbiosPlugin(SourcePlugin):
     """
-    Create MBR boot partition and install syslinux on it.
+    Create MBR boot partition.
+    This plugin supports syslinux and GRUB 2 bootloaders.
     """
 
     name = 'bootimg-pcbios'
+
+    @classmethod
+    def _create_grub_core_img(cls, grubdir):
+        """
+        Create the core image in the grub directory.
+        """
+        grub_modules = "at_keyboard biosdisk boot chain configfile ext2 fat linux ls part_msdos reboot serial vga"
+        cmd_mkimage = "grub-mkimage -p %s -d %s -o %s/core.img -O i386-pc %s" % (
+                       "(hd0,msdos1)/grub",
+                       grubdir,
+                       grubdir,
+                       grub_modules)
+
+        exec_cmd(cmd_mkimage)
 
     @classmethod
     def _get_bootimg_dir(cls, bootimg_dir, dirname):
@@ -76,17 +92,100 @@ class BootimgPcbiosPlugin(SourcePlugin):
         dd_cmd = "dd if=%s of=%s conv=notrunc" % (mbrfile, full_path)
         exec_cmd(dd_cmd, native_sysroot)
 
-    @classmethod
-    def do_configure_partition(cls, part, source_params, creator, cr_workdir,
-                               oe_builddir, bootimg_dir, kernel_dir,
-                               native_sysroot):
-        """
-        Called before do_prepare_partition(), creates syslinux config
-        """
-        hdddir = "%s/hdd/boot" % cr_workdir
+        device_map_path = "%s/device.map" % workdir
+        device_map_content = "(hd0) %s" % full_path
+        with open(device_map_path, 'w') as file:
+            file.write(device_map_content)
 
-        install_cmd = "install -d %s" % hdddir
+        # We need to call grub-bios-setup to actually install GRUB on disk. It needs
+        # to be called on the disk file, as opposed to the syslinux, to be called on
+        # the partition.
+        # TODO: There is no way to access source_params from the do_install_disk?
+        source_params = dict()
+        source_params['loader-pcbios'] = 'grub'
+        if source_params['loader-pcbios'] == 'grub':
+
+            grub_dir = os.path.join(workdir, "hdd/boot/grub/i386-pc")
+            cmd_bios_setup = 'grub-bios-setup -v --device-map=%s -r "hd0,msdos1" -d %s %s' % (
+                              device_map_path,
+                              grub_dir,
+                              full_path
+                              )
+            exec_cmd(cmd_bios_setup, native_sysroot)
+
+    @classmethod
+    def do_configure_grub(cls, hdddir, creator, cr_workdir, source_params):
+        """
+        Creates loader-specific (grub) config
+        """
+
+        # Create config file
+        bootloader = creator.ks.bootloader
+
+        grubdir = os.path.join(hdddir, "grub")
+        install_cmd = "install -d %s" % grubdir
         exec_cmd(install_cmd)
+
+        deploy_dir = get_bitbake_var("DEPLOY_DIR_IMAGE")
+
+        custom_cfg = None
+        if bootloader.configfile:
+            custom_cfg = get_custom_config(bootloader.configfile)
+            if custom_cfg:
+                # Use a custom configuration for grub
+                grub_conf = custom_cfg
+                logger.debug("Using custom configuration file %s "
+                             "for grub.cfg", bootloader.configfile)
+            else:
+                raise WicError("configfile is specified but failed to "
+                               "get it from %s." % bootloader.configfile)
+
+        initrd = source_params.get('initrd')
+
+        if not custom_cfg:
+            # Create grub configuration using parameters from wks file
+            bootloader = creator.ks.bootloader
+            title = source_params.get('title')
+
+            grub_conf = ""
+            grub_conf += "serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1\n"
+            grub_conf += "default=boot\n"
+            grub_conf += "timeout=%s\n" % bootloader.timeout
+            grub_conf += "menuentry '%s'{\n" % (title if title else "boot")
+
+            kernel = get_bitbake_var("KERNEL_IMAGETYPE")
+            if get_bitbake_var("INITRAMFS_IMAGE_BUNDLE") == "1":
+                if get_bitbake_var("INITRAMFS_IMAGE"):
+                    kernel = "%s-%s.bin" % \
+                        (get_bitbake_var("KERNEL_IMAGETYPE"), get_bitbake_var("INITRAMFS_LINK_NAME"))
+
+            label = source_params.get('label')
+            label_conf = "root=%s" % creator.rootdev
+            if label:
+                label_conf = "LABEL=%s" % label
+
+            grub_conf += "linux /%s %s rootwait %s\n" \
+                % (kernel, label_conf, bootloader.append)
+
+            if initrd:
+                initrds = initrd.split(';')
+                grub_conf += "initrd"
+                for rd in initrds:
+                    grub_conf += " /%s" % rd
+                grub_conf += "\n"
+
+            grub_conf += "}\n"
+
+        logger.debug("Writing grub config %s/grub.cfg", grubdir)
+        cfg = open("%s/grub.cfg" % grubdir, "w")
+        cfg.write(grub_conf)
+        cfg.close()
+
+    @classmethod
+    def do_configure_syslinux(cls, hdddir, creator, cr_workdir, source_params):
+        """
+        Creates loader-specific (syslinux) config
+        """
 
         bootloader = creator.ks.bootloader
 
@@ -94,7 +193,7 @@ class BootimgPcbiosPlugin(SourcePlugin):
         if bootloader.configfile:
             custom_cfg = get_custom_config(bootloader.configfile)
             if custom_cfg:
-                # Use a custom configuration for grub
+                # Use a custom configuration for syslinux
                 syslinux_conf = custom_cfg
                 logger.debug("Using custom configuration file %s "
                              "for syslinux.cfg", bootloader.configfile)
@@ -135,6 +234,61 @@ class BootimgPcbiosPlugin(SourcePlugin):
         cfg.close()
 
     @classmethod
+    def do_configure_partition(cls, part, source_params, creator, cr_workdir,
+                               oe_builddir, bootimg_dir, kernel_dir,
+                               native_sysroot):
+        """
+        Called before do_prepare_partition(), creates loader-specific config
+        """
+        hdddir = "%s/hdd/boot" % cr_workdir
+
+        install_cmd = "install -d %s" % hdddir
+        exec_cmd(install_cmd)
+
+        try:
+            if source_params['loader-pcbios'] == 'grub':
+                cls.do_configure_grub(hdddir, creator, cr_workdir, source_params)
+            elif source_params['loader-pcbios'] == 'syslinux':
+                cls.do_configure_syslinux(hdddir, creator, cr_workdir, source_params)
+            else:
+                raise WicError("unrecognized bootimg-pcbios loader: %s" % source_params['loader-pcbios'])
+        except KeyError:
+            raise WicError("bootimg-pcbios requires a loader, none specified")
+
+    @classmethod
+    def do_prepare_grub(cls, part, hdddir, bootimg_dir, staging_kernel_dir):
+        """
+        Partition preparation specific to grub loader
+        """
+
+        # Copying grub modules
+        grub_dir = os.path.join(hdddir, "grub/i386-pc")
+        grub_dir_native = os.path.join(get_bitbake_var("IMAGE_ROOTFS"), "usr/lib/grub/i386-pc")
+        logger.debug("Copying grub modules from: %s to: %s", grub_dir_native, grub_dir)
+        shutil.copytree(grub_dir_native, grub_dir)
+
+        cls._create_grub_core_img(grub_dir)
+
+
+    @classmethod
+    def do_prepare_syslinux(cls, part, hdddir, bootimg_dir, staging_kernel_dir):
+        """
+        Partition preparation specific to syslinux loader
+        """
+
+        cmds = ("install -m 444 %s/syslinux/ldlinux.sys %s/ldlinux.sys" %
+                (bootimg_dir, hdddir),
+                "install -m 0644 %s/syslinux/vesamenu.c32 %s/vesamenu.c32" %
+                (bootimg_dir, hdddir),
+                "install -m 444 %s/syslinux/libcom32.c32 %s/libcom32.c32" %
+                (bootimg_dir, hdddir),
+                "install -m 444 %s/syslinux/libutil.c32 %s/libutil.c32" %
+                (bootimg_dir, hdddir))
+
+        for install_cmd in cmds:
+            exec_cmd(install_cmd)
+
+    @classmethod
     def do_prepare_partition(cls, part, source_params, creator, cr_workdir,
                              oe_builddir, bootimg_dir, kernel_dir,
                              rootfs_dir, native_sysroot):
@@ -155,19 +309,18 @@ class BootimgPcbiosPlugin(SourcePlugin):
                 kernel = "%s-%s.bin" % \
                     (get_bitbake_var("KERNEL_IMAGETYPE"), get_bitbake_var("INITRAMFS_LINK_NAME"))
 
-        cmds = ("install -m 0644 %s/%s %s/%s" %
-                (staging_kernel_dir, kernel, hdddir, get_bitbake_var("KERNEL_IMAGETYPE")),
-                "install -m 444 %s/syslinux/ldlinux.sys %s/ldlinux.sys" %
-                (bootimg_dir, hdddir),
-                "install -m 0644 %s/syslinux/vesamenu.c32 %s/vesamenu.c32" %
-                (bootimg_dir, hdddir),
-                "install -m 444 %s/syslinux/libcom32.c32 %s/libcom32.c32" %
-                (bootimg_dir, hdddir),
-                "install -m 444 %s/syslinux/libutil.c32 %s/libutil.c32" %
-                (bootimg_dir, hdddir))
+        install_cmd = "install -m 0644 %s/%s %s/%s" % (staging_kernel_dir, kernel, hdddir, get_bitbake_var("KERNEL_IMAGETYPE"))
+        exec_cmd(install_cmd)
 
-        for install_cmd in cmds:
-            exec_cmd(install_cmd)
+        try:
+            if source_params['loader-pcbios'] == 'grub':
+                cls.do_prepare_grub(part, hdddir, bootimg_dir, staging_kernel_dir)
+            elif source_params['loader-pcbios'] == 'syslinux':
+                cls.do_prepare_syslinux(part, hdddir, bootimg_dir, staging_kernel_dir)
+            else:
+                raise WicError("unrecognized bootimg-pcbios loader: %s" % source_params['loader-pcbios'])
+        except KeyError:
+            raise WicError("bootimg-pcbios requires a loader, none specified")
 
         du_cmd = "du -bks %s" % hdddir
         out = exec_cmd(du_cmd)
@@ -195,8 +348,9 @@ class BootimgPcbiosPlugin(SourcePlugin):
         mcopy_cmd = "mcopy -i %s -s %s/* ::/" % (bootimg, hdddir)
         exec_native_cmd(mcopy_cmd, native_sysroot)
 
-        syslinux_cmd = "syslinux %s" % bootimg
-        exec_native_cmd(syslinux_cmd, native_sysroot)
+        if source_params['loader-pcbios'] == 'syslinux':
+            syslinux_cmd = "syslinux %s" % bootimg
+            exec_native_cmd(syslinux_cmd, native_sysroot)
 
         chmod_cmd = "chmod 644 %s" % bootimg
         exec_cmd(chmod_cmd)
